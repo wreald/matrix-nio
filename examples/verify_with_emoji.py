@@ -81,6 +81,8 @@ from nio import (
     LocalProtocolError,
     LoginResponse,
     ToDeviceError,
+    ToDeviceMessage,
+    UnknownToDeviceEvent,
 )
 
 # file to store credentials in case you want to run program multiple times
@@ -101,7 +103,38 @@ class Callbacks:
         try:
             client = self.client
 
-            if isinstance(event, KeyVerificationStart):  # first step
+            if event.source['type'] == 'm.key.verification.request':
+                """First step in new flow: receive a request proposing
+                a set of verification methods, and in this case respond
+                saying we only support SAS verification.
+                """
+                print(
+                    "Got verification request. "
+                    "Waiting for other device to accept SAS method..."
+                )
+                if 'm.sas.v1' not in event.source['content']['methods']:
+                    print(
+                        "Other device does not support SAS authentication. "
+                        f"Methods: {event.source['content']['methods']}."
+                    )
+                    return
+                assert client.device_id is not None
+                assert client.user_id is not None
+                txid = event.source['content']['transaction_id']
+                ready_event = ToDeviceMessage(
+                    type                = 'm.key.verification.ready',
+                    recipient           = event.sender,
+                    recipient_device    = event.source['content']['from_device'],
+                    content             = {
+                        'from_device': client.device_id,
+                        'methods': ['m.sas.v1'],
+                        'transaction_id': txid,
+                    },
+                )
+                resp = await client.to_device(ready_event, txid)
+                if isinstance(resp, ToDeviceError):
+                    print(f"to_device failed with {resp}")
+            elif isinstance(event, KeyVerificationStart):  # first step
                 """first step: receive KeyVerificationStart
                 KeyVerificationStart(
                     source={'content':
@@ -196,6 +229,23 @@ class Callbacks:
                     resp = await client.confirm_short_auth_string(event.transaction_id)
                     if isinstance(resp, ToDeviceError):
                         print(f"confirm_short_auth_string failed with {resp}")
+
+                    # Extra step in new flow: once we have completed the SAS
+                    # verification successfully, send a 'done' to-device event
+                    # to the other device to assert that the verification was
+                    # successful.
+                    done_message = ToDeviceMessage(
+                        type                = 'm.key.verification.done',
+                        recipient           = event.sender,
+                        recipient_device    = sas.other_olm_device.device_id,
+                        content             = {
+                            'transaction_id': sas.transaction_id,
+                        },
+                    )
+                    resp = await client.to_device(done_message, sas.transaction_id)
+                    if isinstance(resp, ToDeviceError):
+                        client.log.error(f"'done' failed with {resp}")
+
                 elif yn.lower() == "n":  # no, don't match, reject
                     print(
                         "No match! Device will NOT be verified "
@@ -244,20 +294,25 @@ class Callbacks:
                     resp = await client.to_device(todevice_msg)
                     if isinstance(resp, ToDeviceError):
                         print(f"to_device failed with {resp}")
-                    print(
-                        f"sas.we_started_it = {sas.we_started_it}\n"
-                        f"sas.sas_accepted = {sas.sas_accepted}\n"
-                        f"sas.canceled = {sas.canceled}\n"
-                        f"sas.timed_out = {sas.timed_out}\n"
-                        f"sas.verified = {sas.verified}\n"
-                        f"sas.verified_devices = {sas.verified_devices}\n"
-                    )
-                    print(
-                        "Emoji verification was successful!\n"
-                        "Hit Control-C to stop the program or "
-                        "initiate another Emoji verification from "
-                        "another device or room."
-                    )
+            elif event.source['type'] == 'm.key.verification.done':
+                # Final step, other device acknowledges verification success.
+                txid = event.source['content']['transaction_id']
+                sas = client.key_verifications[txid]
+
+                print(
+                    f"sas.we_started_it = {sas.we_started_it}\n"
+                    f"sas.sas_accepted = {sas.sas_accepted}\n"
+                    f"sas.canceled = {sas.canceled}\n"
+                    f"sas.timed_out = {sas.timed_out}\n"
+                    f"sas.verified = {sas.verified}\n"
+                    f"sas.verified_devices = {sas.verified_devices}\n"
+                )
+                print(
+                    "Emoji verification was successful!\n"
+                    "Hit Control-C to stop the program or "
+                    "initiate another Emoji verification from "
+                    "another device or room."
+                )
             else:
                 print(
                     f"Received unexpected event type {type(event)}. "
@@ -377,7 +432,7 @@ async def main() -> None:
     client = await login()
     # Set up event callbacks
     callbacks = Callbacks(client)
-    client.add_to_device_callback(callbacks.to_device_callback, (KeyVerificationEvent,))
+    client.add_to_device_callback(callbacks.to_device_callback, (KeyVerificationEvent, UnknownToDeviceEvent))
     # Sync encryption keys with the server
     # Required for participating in encrypted rooms
     if client.should_upload_keys:
